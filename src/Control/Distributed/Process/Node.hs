@@ -138,7 +138,7 @@ import Control.Distributed.Process.Internal.Types
   , WhereIsReply(..)
   , messageToPayload
   , payloadToMessage
-  , createMessage
+  , createUnencodedMessage
   , runLocalProcess
   , firstNonReservedProcessId
   , ImplicitReconnect(WithImplicitReconnect, NoImplicitReconnect)
@@ -171,6 +171,8 @@ import qualified Control.Distributed.Process.Internal.StrictContainerAccessors a
   ( mapMaybe
   , mapDefault
   )
+
+import Unsafe.Coerce
 
 --------------------------------------------------------------------------------
 -- Initialization                                                             --
@@ -577,6 +579,10 @@ nodeController = do
         ncEffectWhereIs from label
       NCMsg from (NamedSend label msg') ->
         ncEffectNamedSend from label msg'
+      NCMsg _ (LocalSend to msg') ->
+        ncEffectLocalSend to msg'
+      NCMsg _ (LocalPortSend to msg') ->
+        ncEffectLocalPortSend to msg'
       NCMsg (ProcessIdentifier from) (Kill to reason) ->
         ncEffectKill from to reason
       NCMsg (ProcessIdentifier from) (Exit to reason) ->
@@ -789,6 +795,28 @@ ncEffectNamedSend from label msg = do
                          NoImplicitReconnect
                          (messageToPayload msg)
 
+-- [Issue #DP-20]
+ncEffectLocalSend :: ProcessId -> Message -> NC ()
+ncEffectLocalSend = postMessage
+
+-- [Issue #DP-20]
+ncEffectLocalPortSend :: SendPortId -> Message -> NC ()
+ncEffectLocalPortSend from msg =
+  let pid = sendPortProcessId from
+      cid = sendPortLocalId   from
+  in do
+  withLocalProc pid $ \proc -> do
+    mChan <- withMVar (processState proc) $ return . (^. typedChannelWithId cid)
+    case mChan of
+      Nothing   -> return () -- not sure about this one!?
+      Just (TypedChannel chan') -> do
+          ch <- deRefWeak chan'
+          -- If mChan is Nothing, the process has given up the read end of
+          -- the channel and we simply ignore the incoming message
+          forM_ ch $ \chan -> atomically $
+            -- We make sure the message is fully decoded when it is enqueued
+            writeTQueue chan $! (unsafeCoerce msg)
+
 -- [Issue #69]
 ncEffectKill :: ProcessId -> ProcessId -> String -> NC ()
 ncEffectKill from to reason = do
@@ -887,21 +915,23 @@ notifyDied dest src reason mRef = do
 
 -- | [Unified: Table 8]
 destNid :: ProcessSignal -> Maybe NodeId
-destNid (Link ident)        = Just $ nodeOf ident
-destNid (Unlink ident)      = Just $ nodeOf ident
-destNid (Monitor ref)       = Just $ nodeOf (monitorRefIdent ref)
-destNid (Unmonitor ref)     = Just $ nodeOf (monitorRefIdent ref)
-destNid (Spawn _ _)         = Nothing
-destNid (Register _ _ _ _)  = Nothing
-destNid (WhereIs _)         = Nothing
-destNid (NamedSend _ _)     = Nothing
+destNid (Link ident)          = Just $ nodeOf ident
+destNid (Unlink ident)        = Just $ nodeOf ident
+destNid (Monitor ref)         = Just $ nodeOf (monitorRefIdent ref)
+destNid (Unmonitor ref)       = Just $ nodeOf (monitorRefIdent ref)
+destNid (Spawn _ _)           = Nothing
+destNid (Register _ _ _ _)    = Nothing
+destNid (WhereIs _)           = Nothing
+destNid (NamedSend _ _)       = Nothing
 -- We don't need to forward 'Died' signals; if monitoring/linking is setup,
 -- then when a local process dies the monitoring/linking machinery will take
 -- care of notifying remote nodes
-destNid (Died _ _)          = Nothing
-destNid (Kill pid _)        = Just $ processNodeId pid
-destNid (Exit pid _)        = Just $ processNodeId pid
-destNid (GetInfo pid)       = Just $ processNodeId pid
+destNid (Died _ _)            = Nothing
+destNid (Kill pid _)          = Just $ processNodeId pid
+destNid (Exit pid _)          = Just $ processNodeId pid
+destNid (GetInfo pid)         = Just $ processNodeId pid
+destNid (LocalSend pid _)     = Just $ processNodeId pid
+destNid (LocalPortSend cid _) = Just $ processNodeId (sendPortProcessId cid)
 
 -- | Check if a process is local to our own node
 isLocal :: LocalNode -> Identifier -> Bool
@@ -938,7 +968,7 @@ isValidLocalIdentifier ident = do
 --------------------------------------------------------------------------------
 
 postAsMessage :: Serializable a => ProcessId -> a -> NC ()
-postAsMessage pid = postMessage pid . createMessage
+postAsMessage pid = postMessage pid . createUnencodedMessage
 
 postMessage :: ProcessId -> Message -> NC ()
 postMessage pid msg = do
